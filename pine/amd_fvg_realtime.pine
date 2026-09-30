@@ -542,8 +542,12 @@ qty      = riskAbs > 0 and syminfo.pointvalue > 0 ? riskCash / (riskAbs * syminf
 tickTP = na(refTP) ? na : math.abs(close - refTP) / syminfo.mintick
 tickSL = na(refSL) ? na : math.abs(close - refSL) / syminfo.mintick
 
-secsLeft = timeframe.isintraday and barstate.isrealtime ? math.max(0, math.floor((time_close - timenow) / 1000)) : na
-cdTxt    = na(secsLeft) ? "—" : pad2(int(secsLeft / 60)) + ":" + pad2(int(secsLeft % 60))
+// A delayed feed reports a "current" bar that already closed, so the countdown
+// goes non-positive. Say so rather than printing a misleading 00:00.
+rawLeft  = timeframe.isintraday and barstate.isrealtime ? math.floor((time_close - timenow) / 1000) : na
+feedLate = not na(rawLeft) and rawLeft <= 0
+secsLeft = na(rawLeft) ? na : math.max(0, rawLeft)
+cdTxt    = na(secsLeft) ? "—" : feedLate ? "delayed feed" : pad2(int(secsLeft / 60)) + ":" + pad2(int(secsLeft % 60))
 
 barsLeft = phase == 1 or phase == 2 ? math.max(0, accEnd + manLook - bar_index) : phase == 3 ? math.max(0, armedBar + armBars - bar_index) : na
 trades   = wins + losses + bes
@@ -583,7 +587,7 @@ if showDash and barstate.islast
     row(15, "Size · risk",  showSize and not na(qty) ? r2(qty) + " · " + r2(riskCash) : "—", dashBg)
     row(16, "Record",       str.tostring(setups) + " setups · " + str.tostring(wins) + "W/" + str.tostring(losses) + "L/" + str.tostring(bes) + "BE" + (na(winRate) ? "" : " · " + r2(winRate) + "%"), dashBg)
     row(17, "Totals",       r2(sumR) + " R · " + r2(sumPct) + "%", dashBg)
-    row(18, "Bar closes",   cdTxt, dashBg)
+    row(18, "Bar closes",   cdTxt, feedLate ? color.new(color.orange, 70) : dashBg)
     row(19, "Journal",      showJournal and str.length(lastRow) > 0 ? lastRow : "—", dashBg)
     row(20, "Waiting on",   diagTxt, phase == 0 ? color.new(color.gray, 70) : color.new(color.orange, 70))
     row(21, "Tightest " + str.tostring(calLook) + "b", na(tightest) ? "—" : r2(tightest) + " " + rangeUnit +
