@@ -1,0 +1,496 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  AMD FVG Real-Time Trade Monitor
+//  Concept base: "AMD FVG Trade Setup [LuxAlgo]" (Accumulation → Manipulation →
+//  Distribution with a Fair Value Gap trigger).
+//
+//  What this version adds over the original:
+//   • An explicit state machine (IDLE → ACCUMULATION → MANIPULATION → ARMED →
+//     IN TRADE) instead of loose boolean flags, so the setup can be invalidated,
+//     cancelled and reported on at every stage.
+//   • Real-time telemetry: live R multiple, MFE/MAE in R, distance to stop and
+//     target in ticks and %, position size, bar-close countdown, running record.
+//   • Optional limit-style entry on the FVG retest (proximal / CE / distal)
+//     with tick-by-tick fill detection, instead of always entering at the close
+//     of the FVG bar.
+//   • Non-repainting option: pattern detection on confirmed bars only, while
+//     fills and stop/target hits are still tracked intrabar.
+//   • Drawings that build live (accumulation and manipulation boxes extend as
+//     they form) and get purged when a setup is invalidated.
+//   • alert() + alertcondition() for every stage of the model.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("AMD FVG Real-Time Trade Monitor", "AMD FVG RT", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// ═══════════════════════════ INPUTS ═════════════════════════════════════════
+gA = "AMD logic"
+accLen            = input.int(30, "Accumulation length", minval = 5, group = gA)
+accWidth          = input.float(0.2, "Accumulation max range %", minval = 0.01, step = 0.1, group = gA)
+manLook           = input.int(10, "Search window after accumulation (bars)", minval = 1, group = gA)
+fvgThreshold      = input.float(0.1, "Min FVG gap (× ATR)", minval = 0.0, step = 0.05, group = gA,
+     tooltip = "Minimum size of the 3-bar gap relative to ATR. Higher = only 'strong' displacement.")
+requireSweepClose = input.bool(true, "Require close back inside the range", group = gA,
+     tooltip = "Bearish: close < accumulation high. Bullish: close > accumulation low.")
+
+gE = "Entry model"
+confirmOnly = input.bool(true, "Detect pattern on bar close only (no repaint)", group = gE)
+liveTrack   = input.bool(true, "Track fills / SL / TP intrabar", group = gE,
+     tooltip = "ON: evaluated on every tick, so the dashboard is live. OFF: only at bar close.")
+entryMode   = input.string("FVG retest", "Entry", options = ["Market on FVG close", "FVG retest"], group = gE)
+fvgFill     = input.string("CE (mid)", "Retest fill level", options = ["Proximal edge", "CE (mid)", "Distal edge"], group = gE)
+armBars     = input.int(20, "Cancel unfilled setup after (bars)", minval = 1, group = gE)
+sessionOnly = input.bool(true, "Only take setups inside an active session", group = gE)
+
+gR = "Risk & targets"
+atrLen   = input.int(14, "ATR length", group = gR)
+slBasis  = input.string("ATR", "Stop basis", options = ["ATR", "Manipulation extreme", "FVG far edge"], group = gR)
+atrMult  = input.float(2.0, "ATR stop multiplier", minval = 0.1, step = 0.1, group = gR)
+slPad    = input.float(0.1, "Structure stop padding (× ATR)", minval = 0.0, step = 0.05, group = gR)
+rrr      = input.float(2.0, "Reward : risk", minval = 0.1, step = 0.1, group = gR)
+showSize = input.bool(true, "Show position size", group = gR)
+acctSize = input.float(10000, "Account size", minval = 0, group = gR)
+riskPct  = input.float(1.0, "Risk per trade (%)", minval = 0, step = 0.1, group = gR)
+
+gS = "Sessions"
+useSydney = input.bool(false, "Sydney  17:00–02:00 (New York time)", group = gS)
+useTokyo  = input.bool(false, "Tokyo   19:00–04:00", group = gS)
+useLondon = input.bool(false, "London  03:00–12:00", group = gS)
+useNY     = input.bool(true,  "New York 08:00–17:00", group = gS)
+showSess  = input.bool(true,  "Shade active session", group = gS)
+
+gD = "Dashboard"
+showDash   = input.bool(true, "Show dashboard", group = gD)
+dashPosIn  = input.string("Top right", "Position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = gD)
+dashSize   = input.string(size.small, "Text size", options = [size.tiny, size.small, size.normal, size.large], group = gD)
+showLive   = input.bool(true, "Floating live trade label", group = gD)
+showLevels = input.bool(true, "Pending entry / SL / TP lines", group = gD)
+
+gC = "Colors"
+accColor  = input.color(color.new(color.gray, 80), "Accumulation", group = gC)
+manColor  = input.color(color.new(#f23645, 75), "Manipulation (bearish sweep)", group = gC)
+manColorB = input.color(color.new(#089981, 75), "Manipulation (bullish sweep)", group = gC)
+tpColor   = input.color(color.new(#089981, 75), "Take profit box", group = gC)
+slColor   = input.color(color.new(#f23645, 75), "Stop loss box", group = gC)
+fvgColor  = input.color(color.new(color.white, 60), "FVG", group = gC)
+dashBg    = input.color(color.new(#131722, 10), "Dashboard background", group = gC)
+dashFg    = input.color(color.white, "Dashboard text", group = gC)
+
+// ═══════════════════════════ HELPERS ════════════════════════════════════════
+px(float v)  => na(v) ? "—" : str.tostring(v, format.mintick)
+r2(float v)  => na(v) ? "—" : str.tostring(math.round(v, 2))
+pad2(int v)  => (v < 10 ? "0" : "") + str.tostring(v)
+
+// Sessions collapse to "always on" when the chart is not intraday, so the model
+// still works on daily+ charts instead of silently never triggering.
+sessOk(string s) => timeframe.isintraday ? not na(time(timeframe.period, s, "America/New_York")) : true
+
+sydOn = useSydney and sessOk("1700-0200")
+tokOn = useTokyo  and sessOk("1900-0400")
+lonOn = useLondon and sessOk("0300-1200")
+nyOn  = useNY     and sessOk("0800-1700")
+
+anyEnabled = useSydney or useTokyo or useLondon or useNY
+inAnySess  = not anyEnabled ? true : (sydOn or tokOn or lonOn or nyOn)
+
+sessTxt = ""
+sessTxt := sessTxt + (sydOn ? "Sydney " : "")
+sessTxt := sessTxt + (tokOn ? "Tokyo " : "")
+sessTxt := sessTxt + (lonOn ? "London " : "")
+sessTxt := sessTxt + (nyOn  ? "New York" : "")
+sessTxt := str.length(sessTxt) == 0 ? (anyEnabled ? "closed" : "all hours") : sessTxt
+
+bgcolor(showSess and inAnySess and anyEnabled ? color.new(color.blue, 96) : na, title = "Session shading")
+
+// ═══════════════════════════ STATE ══════════════════════════════════════════
+// phase: 0 idle · 1 accumulation / waiting for sweep · 2 swept, hunting FVG
+//        3 armed (waiting for fill) · 4 in trade
+var int   phase      = 0
+var float accHigh    = na
+var float accLow     = na
+var int   accStart   = na
+var int   accEnd     = na
+var int   manDir     = 0        // +1 = swept the highs, -1 = swept the lows
+var float manExt     = na
+var float fvgTop     = na
+var float fvgBot     = na
+var int   tradeDir   = 0        // +1 long, -1 short
+var float pendEntry  = na
+var float pendSL     = na
+var float pendTP     = na
+var int   armedBar   = na
+var float entryPrice = na
+var float slLevel    = na
+var float tpLevel    = na
+var int   entryBar   = na
+var float mfeR       = 0.0
+var float maeR       = 0.0
+var int   setups     = 0
+var int   wins       = 0
+var int   losses     = 0
+var float sumR       = 0.0
+
+var box   accBox  = na
+var box   manBox  = na
+var box   fvgBox  = na
+var box   tpBox   = na
+var box   slBox   = na
+var line  eLn     = na
+var line  sLn     = na
+var line  tLn     = na
+var label liveLbl = na
+
+// ═══════════════════════════ DERIVED ════════════════════════════════════════
+atr      = ta.atr(atrLen)
+hiN      = ta.highest(high, accLen)
+loN      = ta.lowest(low, accLen)
+rangePct = loN > 0 ? (hiN - loN) / loN * 100 : na
+isAcc    = not na(rangePct) and rangePct <= accWidth and (not sessionOnly or inAnySess)
+
+newBar = confirmOnly ? barstate.isconfirmed : true
+tickOk = liveTrack ? true : barstate.isconfirmed
+
+// Event flags (top level so alertcondition can read them)
+bool evtAcc    = false
+bool evtSweep  = false
+bool evtArm    = false
+bool evtFill   = false
+bool evtTP     = false
+bool evtSL     = false
+bool evtCancel = false
+
+// 0 = nothing · 1 = cancel setup (purge live drawings) · 2 = trade finished (keep drawings)
+int  resetMode = 0
+bool doEnter   = false
+float enterAt  = na
+float liveR    = na
+
+// ── Phase 0/1 · accumulation range forms and keeps updating ────────────────
+if newBar and phase <= 1 and isAcc
+    accHigh  := hiN
+    accLow   := loN
+    accStart := bar_index - accLen + 1
+    accEnd   := bar_index
+    manDir   := 0
+    manExt   := na
+    if phase == 0
+        phase   := 1
+        evtAcc  := true
+    if na(accBox)
+        accBox := box.new(accStart, accHigh, accEnd, accLow, bgcolor = accColor, border_color = na)
+    else
+        accBox.set_lefttop(accStart, accHigh)
+        accBox.set_rightbottom(accEnd, accLow)
+
+// ── Phase 1 · wait for the liquidity sweep inside the search window ────────
+if newBar and phase == 1 and not isAcc and not na(accHigh)
+    if bar_index > accEnd + manLook
+        resetMode := 1
+        evtCancel := true
+    else if high > accHigh
+        manDir := 1
+        manExt := high
+        phase  := 2
+        manBox := box.new(accEnd, manExt, bar_index, accHigh, bgcolor = manColor, border_color = na)
+        evtSweep := true
+    else if low < accLow
+        manDir := -1
+        manExt := low
+        phase  := 2
+        manBox := box.new(accEnd, accLow, bar_index, manExt, bgcolor = manColorB, border_color = na)
+        evtSweep := true
+
+// ── Phase 2 · hunt for the displacement FVG in the sweep direction ─────────
+bool  found = false
+float zTop  = na
+float zBot  = na
+
+if newBar and phase == 2
+    if manDir == 1
+        manExt := math.max(manExt, high)
+        if not na(manBox)
+            manBox.set_top(manExt)
+            manBox.set_right(bar_index)
+        gapB = low[2] - high                       // bearish FVG: high[0] below low[2]
+        if gapB > atr * fvgThreshold and (not requireSweepClose or close < accHigh)
+            found := true
+            zTop  := low[2]
+            zBot  := high
+    else if manDir == -1
+        manExt := math.min(manExt, low)
+        if not na(manBox)
+            manBox.set_bottom(manExt)
+            manBox.set_right(bar_index)
+        gapU = low - high[2]                       // bullish FVG: low[0] above high[2]
+        if gapU > atr * fvgThreshold and (not requireSweepClose or close > accLow)
+            found := true
+            zTop  := low
+            zBot  := high[2]
+    if not found and bar_index > accEnd + manLook
+        resetMode := 1
+        evtCancel := true
+
+// ── FVG found · build the trade plan ───────────────────────────────────────
+if found
+    fvgTop   := zTop
+    fvgBot   := zBot
+    tradeDir := manDir == 1 ? -1 : 1               // swept the highs → short
+    fvgBox   := box.new(bar_index - 2, zTop, bar_index, zBot, bgcolor = fvgColor,
+         border_color = fvgColor, border_style = line.style_dotted)
+
+    float e = na
+    if entryMode == "Market on FVG close"
+        e := close
+    else
+        prox = tradeDir == -1 ? zBot : zTop        // edge the price meets first
+        dist = tradeDir == -1 ? zTop : zBot
+        e := fvgFill == "Proximal edge" ? prox : fvgFill == "Distal edge" ? dist : math.avg(zTop, zBot)
+
+    float s = switch slBasis
+        "Manipulation extreme" => tradeDir == 1 ? manExt - atr * slPad : manExt + atr * slPad
+        "FVG far edge"         => tradeDir == 1 ? zBot   - atr * slPad : zTop   + atr * slPad
+        => tradeDir == 1 ? e - atr * atrMult : e + atr * atrMult
+
+    // A structure stop on the wrong side of the entry is unusable → fall back to ATR.
+    if na(s) or (tradeDir == 1 ? s >= e : s <= e)
+        s := tradeDir == 1 ? e - atr * atrMult : e + atr * atrMult
+
+    risk0     = math.abs(e - s)
+    pendEntry := e
+    pendSL    := s
+    pendTP    := tradeDir == 1 ? e + risk0 * rrr : e - risk0 * rrr
+    armedBar  := bar_index
+    setups    += 1
+
+    if entryMode == "Market on FVG close"
+        doEnter := true
+        enterAt := close
+    else
+        phase  := 3
+        evtArm := true
+        if showLevels
+            eLn := line.new(bar_index, pendEntry, bar_index + 3, pendEntry, color = color.orange, style = line.style_dashed, width = 1)
+            sLn := line.new(bar_index, pendSL,    bar_index + 3, pendSL,    color = color.new(#f23645, 30), style = line.style_dotted)
+            tLn := line.new(bar_index, pendTP,    bar_index + 3, pendTP,    color = color.new(#089981, 30), style = line.style_dotted)
+
+// ── Phase 3 · armed, waiting for the retest to fill (checked every tick) ───
+if phase == 3 and tickOk and resetMode == 0
+    if showLevels and not na(eLn)
+        eLn.set_x2(bar_index + 3)
+        sLn.set_x2(bar_index + 3)
+        tLn.set_x2(bar_index + 3)
+    hit  = tradeDir == 1 ? low <= pendEntry : high >= pendEntry
+    gone = tradeDir == 1 ? high >= pendTP   : low  <= pendTP     // target reached un-filled
+    if hit
+        doEnter := true
+        enterAt := pendEntry
+    else if gone or bar_index > armedBar + armBars
+        resetMode := 1
+        evtCancel := true
+
+// ── Entry ──────────────────────────────────────────────────────────────────
+if doEnter and phase != 4
+    phase      := 4
+    entryPrice := enterAt
+    slLevel    := pendSL
+    tpLevel    := pendTP
+    entryBar   := bar_index
+    mfeR       := 0.0
+    maeR       := 0.0
+    evtFill    := true
+    tpBox := box.new(bar_index, entryPrice, bar_index, tpLevel, bgcolor = tpColor, border_color = na)
+    slBox := box.new(bar_index, entryPrice, bar_index, slLevel, bgcolor = slColor, border_color = na)
+    label.new(bar_index, tradeDir == 1 ? low : high,
+         (tradeDir == 1 ? "▲ AMD long " : "▼ AMD short ") + px(entryPrice),
+         color = tradeDir == 1 ? color.new(#089981, 0) : color.new(#f23645, 0),
+         style = tradeDir == 1 ? label.style_label_up : label.style_label_down,
+         textcolor = color.white, size = size.tiny)
+    // Hand the pattern drawings over to history and start fresh handles.
+    accBox := na
+    manBox := na
+    fvgBox := na
+    if not na(eLn)
+        eLn.delete()
+        sLn.delete()
+        tLn.delete()
+        eLn := na
+        sLn := na
+        tLn := na
+
+// ── Phase 4 · live trade management ────────────────────────────────────────
+if phase == 4
+    risk = math.abs(entryPrice - slLevel)
+    if not na(tpBox)
+        tpBox.set_right(bar_index)
+        slBox.set_right(bar_index)
+    if risk > 0
+        liveR := tradeDir * (close - entryPrice) / risk
+        hiR   = tradeDir == 1 ? (high - entryPrice) / risk : (entryPrice - low) / risk
+        loR   = tradeDir == 1 ? (low - entryPrice) / risk  : (entryPrice - high) / risk
+        mfeR  := math.max(mfeR, hiR)
+        maeR  := math.min(maeR, loR)
+    // On the entry bar the bar's own high/low partly pre-date the fill, so only
+    // let a real-time tick close the trade on that bar.
+    sameBar   = bar_index == entryBar
+    allowExit = tickOk and (not sameBar or barstate.isrealtime)
+    if allowExit
+        slHit = tradeDir == 1 ? low <= slLevel  : high >= slLevel
+        tpHit = tradeDir == 1 ? high >= tpLevel : low  <= tpLevel
+        if slHit                                   // stop wins a same-bar tie
+            losses    += 1
+            sumR      += -1.0
+            resetMode := 2
+            evtSL     := true
+        else if tpHit
+            wins      += 1
+            sumR      += rrr
+            resetMode := 2
+            evtTP     := true
+
+// ── Reset ──────────────────────────────────────────────────────────────────
+if resetMode != 0
+    phase     := 0
+    accHigh   := na
+    accLow    := na
+    manDir    := 0
+    manExt    := na
+    fvgTop    := na
+    fvgBot    := na
+    pendEntry := na
+    pendSL    := na
+    pendTP    := na
+    if resetMode == 1                              // cancelled: wipe live drawings
+        if not na(accBox)
+            accBox.delete()
+            accBox := na
+        if not na(manBox)
+            manBox.delete()
+            manBox := na
+        if not na(fvgBox)
+            fvgBox.delete()
+            fvgBox := na
+        if not na(eLn)
+            eLn.delete()
+            sLn.delete()
+            tLn.delete()
+            eLn := na
+            sLn := na
+            tLn := na
+    else                                           // trade finished: keep the record
+        tradeDir := 0
+        tpBox := na
+        slBox := na
+
+// ═══════════════════════════ REAL-TIME READOUT ══════════════════════════════
+phaseTxt = switch phase
+    1 => "Accumulation"
+    2 => "Manipulation"
+    3 => "Armed · waiting fill"
+    4 => tradeDir == 1 ? "LONG open" : "SHORT open"
+    => "Idle"
+
+phaseCol = switch phase
+    1 => color.new(color.gray, 55)
+    2 => color.new(color.orange, 55)
+    3 => color.new(color.yellow, 55)
+    4 => tradeDir == 1 ? color.new(#089981, 45) : color.new(#f23645, 45)
+    => color.new(color.gray, 75)
+
+refEntry = phase == 4 ? entryPrice : pendEntry
+refSL    = phase == 4 ? slLevel    : pendSL
+refTP    = phase == 4 ? tpLevel    : pendTP
+riskAbs  = math.abs(nz(refEntry) - nz(refSL))
+
+riskCash = acctSize * riskPct / 100
+qty      = riskAbs > 0 and syminfo.pointvalue > 0 ? riskCash / (riskAbs * syminfo.pointvalue) : na
+
+tickTP = na(refTP) ? na : math.abs(close - refTP) / syminfo.mintick
+tickSL = na(refSL) ? na : math.abs(close - refSL) / syminfo.mintick
+
+secsLeft = timeframe.isintraday and barstate.isrealtime ? math.max(0, math.floor((time_close - timenow) / 1000)) : na
+cdTxt    = na(secsLeft) ? "—" : pad2(int(secsLeft / 60)) + ":" + pad2(int(secsLeft % 60))
+
+barsLeft = phase == 1 or phase == 2 ? math.max(0, accEnd + manLook - bar_index) : phase == 3 ? math.max(0, armedBar + armBars - bar_index) : na
+trades   = wins + losses
+winRate  = trades > 0 ? wins / trades * 100 : na
+
+dashPos = switch dashPosIn
+    "Top left"      => position.top_left
+    "Bottom right"  => position.bottom_right
+    "Bottom left"   => position.bottom_left
+    "Middle right"  => position.middle_right
+    => position.top_right
+
+var table dash = table.new(dashPos, 2, 17, border_width = 1, border_color = color.new(color.gray, 70), frame_width = 1, frame_color = color.new(color.gray, 60))
+
+row(int r, string k, string v, color bg) =>
+    table.cell(dash, 0, r, k, text_color = color.new(dashFg, 25), bgcolor = bg, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, r, v, text_color = dashFg,                bgcolor = bg, text_size = dashSize, text_halign = text.align_right)
+
+if showDash and barstate.islast
+    table.cell(dash, 0, 0, "AMD FVG", text_color = dashFg, bgcolor = dashBg, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = dashFg, bgcolor = dashBg, text_size = dashSize, text_halign = text.align_right)
+    row(1,  "Session",      sessTxt, inAnySess ? color.new(#089981, 75) : dashBg)
+    row(2,  "Phase",        phaseTxt, phaseCol)
+    row(3,  "Range %",      (na(rangePct) ? "—" : r2(rangePct)) + " / " + r2(accWidth), dashBg)
+    row(4,  "Acc. hi · lo", px(accHigh) + " · " + px(accLow), dashBg)
+    row(5,  "Sweep",        manDir == 0 ? "—" : (manDir == 1 ? "highs @ " : "lows @ ") + px(manExt), dashBg)
+    row(6,  "Bars left",    na(barsLeft) ? "—" : str.tostring(barsLeft), dashBg)
+    row(7,  "FVG",          na(fvgTop) ? "—" : px(fvgBot) + " → " + px(fvgTop), dashBg)
+    row(8,  phase == 4 ? "Entry" : "Entry (pending)", px(refEntry), dashBg)
+    row(9,  "Stop",         px(refSL) + (na(tickSL) ? "" : "  (" + str.tostring(math.round(tickSL)) + "t)"), dashBg)
+    row(10, "Target",       px(refTP) + (na(tickTP) ? "" : "  (" + str.tostring(math.round(tickTP)) + "t)"), dashBg)
+    row(11, "Open R",       na(liveR) ? "—" : r2(liveR) + " R", na(liveR) ? dashBg : (liveR >= 0 ? color.new(#089981, 65) : color.new(#f23645, 65)))
+    row(12, "MFE · MAE",    phase == 4 ? r2(mfeR) + " R · " + r2(maeR) + " R" : "—", dashBg)
+    row(13, "Last price",   px(close), dashBg)
+    row(14, "Size · risk",  showSize and not na(qty) ? r2(qty) + " · " + r2(riskCash) : "—", dashBg)
+    row(15, "Record",       str.tostring(setups) + " setups · " + str.tostring(wins) + "W/" + str.tostring(losses) + "L" + (na(winRate) ? "" : " · " + r2(winRate) + "%"), dashBg)
+    row(16, "Bar closes",   cdTxt + "   |   " + r2(sumR) + " R total", dashBg)
+
+// Floating label that follows price while a setup is armed or a trade is open
+if showLive and barstate.islast
+    txt = phase == 4 ?
+         (tradeDir == 1 ? "LONG " : "SHORT ") + r2(liveR) + "R   SL " + px(slLevel) + "   TP " + px(tpLevel) :
+         phase == 3 ? (tradeDir == 1 ? "LONG limit " : "SHORT limit ") + px(pendEntry) : ""
+    if str.length(txt) == 0
+        if not na(liveLbl)
+            liveLbl.delete()
+            liveLbl := na
+    else
+        if na(liveLbl)
+            liveLbl := label.new(bar_index, close, txt, style = label.style_label_left,
+                 color = color.new(color.black, 20), textcolor = color.white, size = size.small)
+        liveLbl.set_xy(bar_index, close)
+        liveLbl.set_text(txt)
+        liveLbl.set_color(phase == 4 ? (nz(liveR) >= 0 ? color.new(#089981, 15) : color.new(#f23645, 15)) : color.new(color.orange, 20))
+
+// ═══════════════════════════ ALERTS ═════════════════════════════════════════
+if evtAcc
+    alert("AMD: accumulation range " + px(accLow) + " – " + px(accHigh), alert.freq_once_per_bar)
+if evtSweep
+    alert("AMD: " + (manDir == 1 ? "high" : "low") + " sweep at " + px(manExt), alert.freq_once_per_bar)
+if evtArm
+    alert("AMD: " + (tradeDir == 1 ? "LONG" : "SHORT") + " armed — entry " + px(pendEntry) + " SL " + px(pendSL) + " TP " + px(pendTP), alert.freq_once_per_bar)
+if evtFill
+    alert("AMD: " + (tradeDir == 1 ? "LONG" : "SHORT") + " filled at " + px(entryPrice) + " · SL " + px(slLevel) + " · TP " + px(tpLevel), alert.freq_once_per_bar)
+if evtTP
+    alert("AMD: target hit (+" + r2(rrr) + "R)", alert.freq_once_per_bar)
+if evtSL
+    alert("AMD: stop hit (-1R)", alert.freq_once_per_bar)
+if evtCancel
+    alert("AMD: setup invalidated", alert.freq_once_per_bar)
+
+alertcondition(evtSweep, "AMD sweep",        "AMD manipulation sweep")
+alertcondition(evtArm,   "AMD setup armed",  "AMD FVG setup armed")
+alertcondition(evtFill,  "AMD entry filled", "AMD entry filled")
+alertcondition(evtTP,    "AMD target hit",   "AMD target hit")
+alertcondition(evtSL,    "AMD stop hit",     "AMD stop hit")
+
+// ═══════════════════════════ DATA WINDOW / SCREENER FEED ════════════════════
+plot(phase,         "Phase",      display = display.data_window)
+plot(tradeDir,      "Direction",  display = display.data_window)
+plot(refEntry,      "Entry",      display = display.data_window)
+plot(refSL,         "Stop",       display = display.data_window)
+plot(refTP,         "Target",     display = display.data_window)
+plot(liveR,         "Open R",     display = display.data_window)
+plot(sumR,          "Total R",    display = display.data_window)
+plot(rangePct,      "Range %",    display = display.data_window)
