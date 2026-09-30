@@ -1,29 +1,28 @@
 //@version=6
 // ─────────────────────────────────────────────────────────────────────────────
-//  AMD FVG Real-Time Trade Monitor
+//  AMD / PO3 FVG Real-Time Trade Monitor
 //  Concept base: "AMD FVG Trade Setup [LuxAlgo]" (Accumulation → Manipulation →
-//  Distribution with a Fair Value Gap trigger).
+//  Distribution with a Fair Value Gap trigger) — i.e. Power of Three.
 //
-//  What this version adds over the original:
-//   • An explicit state machine (IDLE → ACCUMULATION → MANIPULATION → ARMED →
-//     IN TRADE) instead of loose boolean flags, so the setup can be invalidated,
-//     cancelled and reported on at every stage.
-//   • Real-time telemetry: live R multiple, MFE/MAE in R, distance to stop and
-//     target in ticks and %, position size, bar-close countdown, running record.
-//   • Optional limit-style entry on the FVG retest (proximal / CE / distal)
-//     with tick-by-tick fill detection, instead of always entering at the close
-//     of the FVG bar.
-//   • Non-repainting option: pattern detection on confirmed bars only, while
-//     fills and stop/target hits are still tracked intrabar.
-//   • Drawings that build live (accumulation and manipulation boxes extend as
-//     they form) and get purged when a setup is invalidated.
-//   • alert() + alertcondition() for every stage of the model.
+//  Built to feed a Notion trading journal whose row is:
+//    Asset · Date · SESSION IN NY · Point of Interest · Outcome/Result · PnL %
+//  so the indicator tags every setup with the journal's own vocabulary
+//  (PO3, LIQ SWEEP, FVG, SMT, OB, NWOG, NDOG) and emits a paste-ready row on exit.
+//
+//  Over the original:
+//   • Explicit state machine (idle → accumulation → manipulation → armed → trade)
+//   • Real-time telemetry: live R, live PnL %, MFE/MAE, distance to SL/TP, size
+//   • Limit entry on the FVG retest with tick-by-tick fill detection
+//   • NY AM / NY PM killzones, HTF bias filter, SMT divergence vs a correlate
+//   • New day / new week opening gaps (NDOG / NWOG) as confluence
+//   • Break-even stop → the journal's third outcome
+//   • Non-repainting detection, with live intrabar fill/exit tracking
 // ─────────────────────────────────────────────────────────────────────────────
-indicator("AMD FVG Real-Time Trade Monitor", "AMD FVG RT", overlay = true,
+indicator("AMD PO3 FVG Real-Time Monitor", "AMD PO3 RT", overlay = true,
      max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
 
 // ═══════════════════════════ INPUTS ═════════════════════════════════════════
-gA = "AMD logic"
+gA = "AMD / PO3 logic"
 accLen            = input.int(30, "Accumulation length", minval = 5, group = gA)
 accWidth          = input.float(0.2, "Accumulation max range %", minval = 0.01, step = 0.1, group = gA)
 manLook           = input.int(10, "Search window after accumulation (bars)", minval = 1, group = gA)
@@ -39,24 +38,40 @@ liveTrack   = input.bool(true, "Track fills / SL / TP intrabar", group = gE,
 entryMode   = input.string("FVG retest", "Entry", options = ["Market on FVG close", "FVG retest"], group = gE)
 fvgFill     = input.string("CE (mid)", "Retest fill level", options = ["Proximal edge", "CE (mid)", "Distal edge"], group = gE)
 armBars     = input.int(20, "Cancel unfilled setup after (bars)", minval = 1, group = gE)
-sessionOnly = input.bool(true, "Only take setups inside an active session", group = gE)
+sessionOnly = input.bool(true, "Only take setups inside an enabled session", group = gE)
 
 gR = "Risk & targets"
-atrLen   = input.int(14, "ATR length", group = gR)
-slBasis  = input.string("ATR", "Stop basis", options = ["ATR", "Manipulation extreme", "FVG far edge"], group = gR)
-atrMult  = input.float(2.0, "ATR stop multiplier", minval = 0.1, step = 0.1, group = gR)
-slPad    = input.float(0.1, "Structure stop padding (× ATR)", minval = 0.0, step = 0.05, group = gR)
-rrr      = input.float(2.0, "Reward : risk", minval = 0.1, step = 0.1, group = gR)
-showSize = input.bool(true, "Show position size", group = gR)
-acctSize = input.float(10000, "Account size", minval = 0, group = gR)
-riskPct  = input.float(1.0, "Risk per trade (%)", minval = 0, step = 0.1, group = gR)
+atrLen    = input.int(14, "ATR length", group = gR)
+slBasis   = input.string("Manipulation extreme", "Stop basis", options = ["ATR", "Manipulation extreme", "FVG far edge"], group = gR)
+atrMult   = input.float(2.0, "ATR stop multiplier", minval = 0.1, step = 0.1, group = gR)
+slPad     = input.float(0.1, "Structure stop padding (× ATR)", minval = 0.0, step = 0.05, group = gR)
+rrr       = input.float(2.0, "Reward : risk", minval = 0.1, step = 0.1, group = gR)
+beTrigger = input.float(1.0, "Move stop to break-even at (R)", minval = 0.0, step = 0.25, group = gR,
+     tooltip = "0 = never. A stop hit after the move is logged as BREAKEVEN, matching the journal's third outcome.")
+showSize  = input.bool(true, "Show position size", group = gR)
+acctSize  = input.float(10000, "Account size", minval = 0, group = gR)
+riskPct   = input.float(1.0, "Risk per trade (%)", minval = 0, step = 0.1, group = gR)
 
-gS = "Sessions"
-useSydney = input.bool(false, "Sydney  17:00–02:00 (New York time)", group = gS)
-useTokyo  = input.bool(false, "Tokyo   19:00–04:00", group = gS)
-useLondon = input.bool(false, "London  03:00–12:00", group = gS)
-useNY     = input.bool(true,  "New York 08:00–17:00", group = gS)
-showSess  = input.bool(true,  "Shade active session", group = gS)
+gS = "Sessions (New York time)"
+useAM    = input.bool(true,  "NY AM", inline = "am", group = gS)
+amSess   = input.session("0830-1100", "", inline = "am", group = gS)
+usePM    = input.bool(true,  "NY PM", inline = "pm", group = gS)
+pmSess   = input.session("1330-1600", "", inline = "pm", group = gS)
+useLon   = input.bool(false, "London", inline = "lo", group = gS)
+lonSess  = input.session("0200-0500", "", inline = "lo", group = gS)
+useAsia  = input.bool(false, "Asia", inline = "as", group = gS)
+asiaSess = input.session("2000-0000", "", inline = "as", group = gS)
+showSess = input.bool(true, "Shade active session", group = gS)
+
+gB = "Bias & confluence"
+useHTF    = input.bool(true, "Higher-timeframe bias filter", group = gB)
+htfTf     = input.timeframe("240", "Bias timeframe", group = gB)
+htfLen    = input.int(21, "Bias EMA length", minval = 2, group = gB)
+requireHTF= input.bool(false, "Only take setups aligned with HTF bias", group = gB)
+useSMT    = input.bool(true, "SMT divergence vs correlated symbol", group = gB)
+smtSym    = input.symbol("CME_MINI:ES1!", "Correlated symbol", group = gB,
+     tooltip = "Chart NQ against ES (or vice versa). SMT = this symbol sweeps its range while the correlate fails to.")
+useGaps   = input.bool(true, "New day / new week opening gaps (NDOG / NWOG)", group = gB)
 
 gD = "Dashboard"
 showDash   = input.bool(true, "Show dashboard", group = gD)
@@ -64,6 +79,7 @@ dashPosIn  = input.string("Top right", "Position", options = ["Top right", "Top 
 dashSize   = input.string(size.small, "Text size", options = [size.tiny, size.small, size.normal, size.large], group = gD)
 showLive   = input.bool(true, "Floating live trade label", group = gD)
 showLevels = input.bool(true, "Pending entry / SL / TP lines", group = gD)
+showJournal= input.bool(true, "Show paste-ready journal row", group = gD)
 
 gC = "Colors"
 accColor  = input.color(color.new(color.gray, 80), "Accumulation", group = gC)
@@ -80,26 +96,56 @@ px(float v)  => na(v) ? "—" : str.tostring(v, format.mintick)
 r2(float v)  => na(v) ? "—" : str.tostring(math.round(v, 2))
 pad2(int v)  => (v < 10 ? "0" : "") + str.tostring(v)
 
-// Sessions collapse to "always on" when the chart is not intraday, so the model
-// still works on daily+ charts instead of silently never triggering.
+// Sessions collapse to "always on" off intraday, so the model still runs on daily+.
 sessOk(string s) => timeframe.isintraday ? not na(time(timeframe.period, s, "America/New_York")) : true
 
-sydOn = useSydney and sessOk("1700-0200")
-tokOn = useTokyo  and sessOk("1900-0400")
-lonOn = useLondon and sessOk("0300-1200")
-nyOn  = useNY     and sessOk("0800-1700")
+amOn   = useAM   and sessOk(amSess)
+pmOn   = usePM   and sessOk(pmSess)
+lonOn  = useLon  and sessOk(lonSess)
+asiaOn = useAsia and sessOk(asiaSess)
 
-anyEnabled = useSydney or useTokyo or useLondon or useNY
-inAnySess  = not anyEnabled ? true : (sydOn or tokOn or lonOn or nyOn)
+anyEnabled = useAM or usePM or useLon or useAsia
+inAnySess  = not anyEnabled ? true : (amOn or pmOn or lonOn or asiaOn)
 
-sessTxt = ""
-sessTxt := sessTxt + (sydOn ? "Sydney " : "")
-sessTxt := sessTxt + (tokOn ? "Tokyo " : "")
-sessTxt := sessTxt + (lonOn ? "London " : "")
-sessTxt := sessTxt + (nyOn  ? "New York" : "")
-sessTxt := str.length(sessTxt) == 0 ? (anyEnabled ? "closed" : "all hours") : sessTxt
+// Journal's "SESSION IN NY" vocabulary, highest priority first.
+sessTag = amOn ? "NY AM SESSION" : pmOn ? "NY PM SESSION" : lonOn ? "LONDON" : asiaOn ? "ASIA" : ""
+sessTxt = str.length(sessTag) > 0 ? sessTag : (anyEnabled ? "closed" : "all hours")
 
 bgcolor(showSess and inAnySess and anyEnabled ? color.new(color.blue, 96) : na, title = "Session shading")
+
+// ═══════════════════════════ CONTEXT: BIAS, SMT, OPENING GAPS ═══════════════
+// [1] inside request.security keeps the higher timeframe from repainting.
+htfClose = request.security(syminfo.tickerid, htfTf, close[1], lookahead = barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_off)
+htfBias  = not useHTF or na(htfClose) or na(htfEma) ? 0 : htfClose > htfEma ? 1 : htfClose < htfEma ? -1 : 0
+biasTxt  = not useHTF ? "off" : htfBias == 1 ? "bullish " + htfTf : htfBias == -1 ? "bearish " + htfTf : "flat"
+
+smtActive = useSMT and smtSym != syminfo.tickerid and smtSym != syminfo.ticker
+cHigh = request.security(smtSym, timeframe.period, high, lookahead = barmerge.lookahead_off)
+cLow  = request.security(smtSym, timeframe.period, low,  lookahead = barmerge.lookahead_off)
+cHiN  = ta.highest(cHigh, accLen)
+cLoN  = ta.lowest(cLow, accLen)
+
+var float ndogHi = na
+var float ndogLo = na
+var float nwogHi = na
+var float nwogLo = na
+newDay  = timeframe.isintraday and ta.change(time("D")) != 0
+newWeek = timeframe.isintraday and ta.change(time("W")) != 0
+if useGaps and newDay and not na(close[1])
+    ndogHi := math.max(close[1], open)
+    ndogLo := math.min(close[1], open)
+if useGaps and newWeek and not na(close[1])
+    nwogHi := math.max(close[1], open)
+    nwogLo := math.min(close[1], open)
+plot(useGaps ? ndogHi : na, "NDOG high", color.new(color.yellow, 40), 1, plot.style_linebr)
+plot(useGaps ? ndogLo : na, "NDOG low",  color.new(color.yellow, 40), 1, plot.style_linebr)
+plot(useGaps ? nwogHi : na, "NWOG high", color.new(color.lime, 40),   1, plot.style_linebr)
+plot(useGaps ? nwogLo : na, "NWOG low",  color.new(color.lime, 40),   1, plot.style_linebr)
+
+// Does a price zone touch a gap zone (with half an ATR of tolerance)?
+touches(float zLo, float zHi, float gLo, float gHi, float tol) =>
+    na(gLo) or na(gHi) ? false : zLo - tol <= gHi and zHi + tol >= gLo
 
 // ═══════════════════════════ STATE ══════════════════════════════════════════
 // phase: 0 idle · 1 accumulation / waiting for sweep · 2 swept, hunting FVG
@@ -121,13 +167,27 @@ var int   armedBar   = na
 var float entryPrice = na
 var float slLevel    = na
 var float tpLevel    = na
+var float riskInit   = na       // risk at entry — R math must survive a BE stop move
 var int   entryBar   = na
+var bool  beMoved    = false
 var float mfeR       = 0.0
 var float maeR       = 0.0
-var int   setups     = 0
-var int   wins       = 0
-var int   losses     = 0
-var float sumR       = 0.0
+
+// Point-of-Interest tags for the journal
+var bool   poiSMT  = false
+var bool   poiOB   = false
+var bool   poiNDOG = false
+var bool   poiNWOG = false
+var string poiTxt  = ""
+var string entrySess = ""
+
+var int   setups = 0
+var int   wins   = 0
+var int   losses = 0
+var int   bes    = 0
+var float sumR   = 0.0
+var float sumPct = 0.0
+var string lastRow = ""
 
 var box   accBox  = na
 var box   manBox  = na
@@ -149,20 +209,21 @@ isAcc    = not na(rangePct) and rangePct <= accWidth and (not sessionOnly or inA
 newBar = confirmOnly ? barstate.isconfirmed : true
 tickOk = liveTrack ? true : barstate.isconfirmed
 
-// Event flags (top level so alertcondition can read them)
 bool evtAcc    = false
 bool evtSweep  = false
 bool evtArm    = false
 bool evtFill   = false
 bool evtTP     = false
 bool evtSL     = false
+bool evtBE     = false
 bool evtCancel = false
 
-// 0 = nothing · 1 = cancel setup (purge live drawings) · 2 = trade finished (keep drawings)
-int  resetMode = 0
-bool doEnter   = false
-float enterAt  = na
-float liveR    = na
+int   resetMode = 0   // 0 none · 1 cancel (purge drawings) · 2 trade finished (keep)
+bool  doEnter   = false
+float enterAt   = na
+float liveR     = na
+float livePct   = na
+string outcome  = ""
 
 // ── Phase 0/1 · accumulation range forms and keeps updating ────────────────
 if newBar and phase <= 1 and isAcc
@@ -173,8 +234,8 @@ if newBar and phase <= 1 and isAcc
     manDir   := 0
     manExt   := na
     if phase == 0
-        phase   := 1
-        evtAcc  := true
+        phase  := 1
+        evtAcc := true
     if na(accBox)
         accBox := box.new(accStart, accHigh, accEnd, accLow, bgcolor = accColor, border_color = na)
     else
@@ -187,16 +248,18 @@ if newBar and phase == 1 and not isAcc and not na(accHigh)
         resetMode := 1
         evtCancel := true
     else if high > accHigh
-        manDir := 1
-        manExt := high
-        phase  := 2
-        manBox := box.new(accEnd, manExt, bar_index, accHigh, bgcolor = manColor, border_color = na)
+        manDir   := 1
+        manExt   := high
+        phase    := 2
+        poiSMT   := smtActive and not na(cHigh) and cHigh < cHiN[1]   // we swept, the correlate did not
+        manBox   := box.new(accEnd, manExt, bar_index, accHigh, bgcolor = manColor, border_color = na)
         evtSweep := true
     else if low < accLow
-        manDir := -1
-        manExt := low
-        phase  := 2
-        manBox := box.new(accEnd, accLow, bar_index, manExt, bgcolor = manColorB, border_color = na)
+        manDir   := -1
+        manExt   := low
+        phase    := 2
+        poiSMT   := smtActive and not na(cLow) and cLow > cLoN[1]
+        manBox   := box.new(accEnd, accLow, bar_index, manExt, bgcolor = manColorB, border_color = na)
         evtSweep := true
 
 // ── Phase 2 · hunt for the displacement FVG in the sweep direction ─────────
@@ -231,46 +294,58 @@ if newBar and phase == 2
 
 // ── FVG found · build the trade plan ───────────────────────────────────────
 if found
-    fvgTop   := zTop
-    fvgBot   := zBot
-    tradeDir := manDir == 1 ? -1 : 1               // swept the highs → short
-    fvgBox   := box.new(bar_index - 2, zTop, bar_index, zBot, bgcolor = fvgColor,
-         border_color = fvgColor, border_style = line.style_dotted)
-
-    float e = na
-    if entryMode == "Market on FVG close"
-        e := close
+    int dir = manDir == 1 ? -1 : 1                 // swept the highs → short
+    // HTF bias filter: drop the setup rather than take it against the 4h/daily.
+    if requireHTF and useHTF and htfBias != 0 and htfBias != dir
+        resetMode := 1
+        evtCancel := true
     else
-        prox = tradeDir == -1 ? zBot : zTop        // edge the price meets first
-        dist = tradeDir == -1 ? zTop : zBot
-        e := fvgFill == "Proximal edge" ? prox : fvgFill == "Distal edge" ? dist : math.avg(zTop, zBot)
+        fvgTop   := zTop
+        fvgBot   := zBot
+        tradeDir := dir
+        // Journal tags. PO3 / LIQ SWEEP / FVG are structural to this model.
+        poiOB   := dir == 1 ? close[2] < open[2] : close[2] > open[2]   // opposing candle before displacement
+        poiNDOG := useGaps and touches(zBot, zTop, ndogLo, ndogHi, atr * 0.5)
+        poiNWOG := useGaps and touches(zBot, zTop, nwogLo, nwogHi, atr * 0.5)
+        poiTxt  := "PO3, LIQ SWEEP, FVG" + (poiSMT ? ", SMT" : "") + (poiOB ? ", OB" : "") +
+             (poiNWOG ? ", NWOG" : "") + (poiNDOG ? ", NDOG" : "")
+        fvgBox  := box.new(bar_index - 2, zTop, bar_index, zBot, bgcolor = fvgColor,
+             border_color = fvgColor, border_style = line.style_dotted)
 
-    float s = switch slBasis
-        "Manipulation extreme" => tradeDir == 1 ? manExt - atr * slPad : manExt + atr * slPad
-        "FVG far edge"         => tradeDir == 1 ? zBot   - atr * slPad : zTop   + atr * slPad
-        => tradeDir == 1 ? e - atr * atrMult : e + atr * atrMult
+        float e = na
+        if entryMode == "Market on FVG close"
+            e := close
+        else
+            prox = dir == -1 ? zBot : zTop         // edge the price meets first
+            dist = dir == -1 ? zTop : zBot
+            e := fvgFill == "Proximal edge" ? prox : fvgFill == "Distal edge" ? dist : math.avg(zTop, zBot)
 
-    // A structure stop on the wrong side of the entry is unusable → fall back to ATR.
-    if na(s) or (tradeDir == 1 ? s >= e : s <= e)
-        s := tradeDir == 1 ? e - atr * atrMult : e + atr * atrMult
+        float s = switch slBasis
+            "Manipulation extreme" => dir == 1 ? manExt - atr * slPad : manExt + atr * slPad
+            "FVG far edge"         => dir == 1 ? zBot   - atr * slPad : zTop   + atr * slPad
+            => dir == 1 ? e - atr * atrMult : e + atr * atrMult
 
-    risk0     = math.abs(e - s)
-    pendEntry := e
-    pendSL    := s
-    pendTP    := tradeDir == 1 ? e + risk0 * rrr : e - risk0 * rrr
-    armedBar  := bar_index
-    setups    += 1
+        // A structure stop on the wrong side of the entry is unusable → fall back to ATR.
+        if na(s) or (dir == 1 ? s >= e : s <= e)
+            s := dir == 1 ? e - atr * atrMult : e + atr * atrMult
 
-    if entryMode == "Market on FVG close"
-        doEnter := true
-        enterAt := close
-    else
-        phase  := 3
-        evtArm := true
-        if showLevels
-            eLn := line.new(bar_index, pendEntry, bar_index + 3, pendEntry, color = color.orange, style = line.style_dashed, width = 1)
-            sLn := line.new(bar_index, pendSL,    bar_index + 3, pendSL,    color = color.new(#f23645, 30), style = line.style_dotted)
-            tLn := line.new(bar_index, pendTP,    bar_index + 3, pendTP,    color = color.new(#089981, 30), style = line.style_dotted)
+        risk0     = math.abs(e - s)
+        pendEntry := e
+        pendSL    := s
+        pendTP    := dir == 1 ? e + risk0 * rrr : e - risk0 * rrr
+        armedBar  := bar_index
+        setups    += 1
+
+        if entryMode == "Market on FVG close"
+            doEnter := true
+            enterAt := close
+        else
+            phase  := 3
+            evtArm := true
+            if showLevels
+                eLn := line.new(bar_index, pendEntry, bar_index + 3, pendEntry, color = color.orange, style = line.style_dashed)
+                sLn := line.new(bar_index, pendSL,    bar_index + 3, pendSL,    color = color.new(#f23645, 30), style = line.style_dotted)
+                tLn := line.new(bar_index, pendTP,    bar_index + 3, pendTP,    color = color.new(#089981, 30), style = line.style_dotted)
 
 // ── Phase 3 · armed, waiting for the retest to fill (checked every tick) ───
 if phase == 3 and tickOk and resetMode == 0
@@ -293,14 +368,17 @@ if doEnter and phase != 4
     entryPrice := enterAt
     slLevel    := pendSL
     tpLevel    := pendTP
+    riskInit   := math.abs(pendEntry - pendSL)
     entryBar   := bar_index
+    beMoved    := false
     mfeR       := 0.0
     maeR       := 0.0
+    entrySess  := str.length(sessTag) > 0 ? sessTag : "—"
     evtFill    := true
     tpBox := box.new(bar_index, entryPrice, bar_index, tpLevel, bgcolor = tpColor, border_color = na)
     slBox := box.new(bar_index, entryPrice, bar_index, slLevel, bgcolor = slColor, border_color = na)
     label.new(bar_index, tradeDir == 1 ? low : high,
-         (tradeDir == 1 ? "▲ AMD long " : "▼ AMD short ") + px(entryPrice),
+         (tradeDir == 1 ? "▲ PO3 long " : "▼ PO3 short ") + px(entryPrice),
          color = tradeDir == 1 ? color.new(#089981, 0) : color.new(#f23645, 0),
          style = tradeDir == 1 ? label.style_label_up : label.style_label_down,
          textcolor = color.white, size = size.tiny)
@@ -318,16 +396,27 @@ if doEnter and phase != 4
 
 // ── Phase 4 · live trade management ────────────────────────────────────────
 if phase == 4
-    risk = math.abs(entryPrice - slLevel)
     if not na(tpBox)
         tpBox.set_right(bar_index)
+    if not na(slBox)
         slBox.set_right(bar_index)
-    if risk > 0
-        liveR := tradeDir * (close - entryPrice) / risk
-        hiR   = tradeDir == 1 ? (high - entryPrice) / risk : (entryPrice - low) / risk
-        loR   = tradeDir == 1 ? (low - entryPrice) / risk  : (entryPrice - high) / risk
-        mfeR  := math.max(mfeR, hiR)
-        maeR  := math.min(maeR, loR)
+    if riskInit > 0
+        liveR   := tradeDir * (close - entryPrice) / riskInit
+        livePct := tradeDir * (close - entryPrice) / entryPrice * 100
+        hiR = tradeDir == 1 ? (high - entryPrice) / riskInit : (entryPrice - low) / riskInit
+        loR = tradeDir == 1 ? (low - entryPrice) / riskInit  : (entryPrice - high) / riskInit
+        mfeR := math.max(mfeR, hiR)
+        maeR := math.min(maeR, loR)
+    // Break-even stop move
+    if beTrigger > 0 and not beMoved and not na(mfeR) and mfeR >= beTrigger
+        slLevel := entryPrice
+        beMoved := true
+        evtBE   := true
+        if not na(slBox)
+            if tradeDir == 1
+                slBox.set_bottom(entryPrice)
+            else
+                slBox.set_top(entryPrice)
     // On the entry bar the bar's own high/low partly pre-date the fill, so only
     // let a real-time tick close the trade on that bar.
     sameBar   = bar_index == entryBar
@@ -336,15 +425,36 @@ if phase == 4
         slHit = tradeDir == 1 ? low <= slLevel  : high >= slLevel
         tpHit = tradeDir == 1 ? high >= tpLevel : low  <= tpLevel
         if slHit                                   // stop wins a same-bar tie
-            losses    += 1
-            sumR      += -1.0
+            outcome   := beMoved ? "BREAKEVEN" : "LOSS execution"
+            exitR     = beMoved ? 0.0 : -1.0
+            exitPct   = tradeDir * (slLevel - entryPrice) / entryPrice * 100
+            sumR      += exitR
+            sumPct    += exitPct
+            if beMoved
+                bes += 1
+            else
+                losses += 1
+            livePct   := exitPct
+            liveR     := exitR
             resetMode := 2
             evtSL     := true
         else if tpHit
+            outcome   := "WIN execution"
+            exitPct2  = tradeDir * (tpLevel - entryPrice) / entryPrice * 100
             wins      += 1
             sumR      += rrr
+            sumPct    += exitPct2
+            livePct   := exitPct2
+            liveR     := rrr
             resetMode := 2
             evtTP     := true
+
+// Paste-ready Notion row: Asset | Date | SESSION IN NY | Point of Interest | Outcome | PnL %
+journalRow = syminfo.ticker + " | " + str.format_time(time, "yyyy-MM-dd", "America/New_York") +
+     " | " + entrySess + " | " + poiTxt + " | " + outcome + " | " +
+     (nz(livePct) >= 0 ? "+" : "") + r2(livePct) + "%"
+if str.length(outcome) > 0
+    lastRow := journalRow
 
 // ── Reset ──────────────────────────────────────────────────────────────────
 if resetMode != 0
@@ -358,7 +468,12 @@ if resetMode != 0
     pendEntry := na
     pendSL    := na
     pendTP    := na
+    poiSMT    := false
+    poiOB     := false
+    poiNDOG   := false
+    poiNWOG   := false
     if resetMode == 1                              // cancelled: wipe live drawings
+        poiTxt := ""
         if not na(accBox)
             accBox.delete()
             accBox := na
@@ -377,8 +492,9 @@ if resetMode != 0
             tLn := na
     else                                           // trade finished: keep the record
         tradeDir := 0
-        tpBox := na
-        slBox := na
+        beMoved  := false
+        tpBox    := na
+        slBox    := na
 
 // ═══════════════════════════ REAL-TIME READOUT ══════════════════════════════
 phaseTxt = switch phase
@@ -398,7 +514,7 @@ phaseCol = switch phase
 refEntry = phase == 4 ? entryPrice : pendEntry
 refSL    = phase == 4 ? slLevel    : pendSL
 refTP    = phase == 4 ? tpLevel    : pendTP
-riskAbs  = math.abs(nz(refEntry) - nz(refSL))
+riskAbs  = phase == 4 ? riskInit : math.abs(nz(refEntry) - nz(refSL))
 
 riskCash = acctSize * riskPct / 100
 qty      = riskAbs > 0 and syminfo.pointvalue > 0 ? riskCash / (riskAbs * syminfo.pointvalue) : na
@@ -410,46 +526,49 @@ secsLeft = timeframe.isintraday and barstate.isrealtime ? math.max(0, math.floor
 cdTxt    = na(secsLeft) ? "—" : pad2(int(secsLeft / 60)) + ":" + pad2(int(secsLeft % 60))
 
 barsLeft = phase == 1 or phase == 2 ? math.max(0, accEnd + manLook - bar_index) : phase == 3 ? math.max(0, armedBar + armBars - bar_index) : na
-trades   = wins + losses
+trades   = wins + losses + bes
 winRate  = trades > 0 ? wins / trades * 100 : na
 
 dashPos = switch dashPosIn
-    "Top left"      => position.top_left
-    "Bottom right"  => position.bottom_right
-    "Bottom left"   => position.bottom_left
-    "Middle right"  => position.middle_right
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
     => position.top_right
 
-var table dash = table.new(dashPos, 2, 17, border_width = 1, border_color = color.new(color.gray, 70), frame_width = 1, frame_color = color.new(color.gray, 60))
+var table dash = table.new(dashPos, 2, 20, border_width = 1, border_color = color.new(color.gray, 70), frame_width = 1, frame_color = color.new(color.gray, 60))
 
 row(int r, string k, string v, color bg) =>
     table.cell(dash, 0, r, k, text_color = color.new(dashFg, 25), bgcolor = bg, text_size = dashSize, text_halign = text.align_left)
     table.cell(dash, 1, r, v, text_color = dashFg,                bgcolor = bg, text_size = dashSize, text_halign = text.align_right)
 
 if showDash and barstate.islast
-    table.cell(dash, 0, 0, "AMD FVG", text_color = dashFg, bgcolor = dashBg, text_size = dashSize, text_halign = text.align_left)
+    table.cell(dash, 0, 0, "AMD · PO3", text_color = dashFg, bgcolor = dashBg, text_size = dashSize, text_halign = text.align_left)
     table.cell(dash, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color = dashFg, bgcolor = dashBg, text_size = dashSize, text_halign = text.align_right)
     row(1,  "Session",      sessTxt, inAnySess ? color.new(#089981, 75) : dashBg)
     row(2,  "Phase",        phaseTxt, phaseCol)
-    row(3,  "Range %",      (na(rangePct) ? "—" : r2(rangePct)) + " / " + r2(accWidth), dashBg)
-    row(4,  "Acc. hi · lo", px(accHigh) + " · " + px(accLow), dashBg)
-    row(5,  "Sweep",        manDir == 0 ? "—" : (manDir == 1 ? "highs @ " : "lows @ ") + px(manExt), dashBg)
-    row(6,  "Bars left",    na(barsLeft) ? "—" : str.tostring(barsLeft), dashBg)
-    row(7,  "FVG",          na(fvgTop) ? "—" : px(fvgBot) + " → " + px(fvgTop), dashBg)
-    row(8,  phase == 4 ? "Entry" : "Entry (pending)", px(refEntry), dashBg)
-    row(9,  "Stop",         px(refSL) + (na(tickSL) ? "" : "  (" + str.tostring(math.round(tickSL)) + "t)"), dashBg)
-    row(10, "Target",       px(refTP) + (na(tickTP) ? "" : "  (" + str.tostring(math.round(tickTP)) + "t)"), dashBg)
-    row(11, "Open R",       na(liveR) ? "—" : r2(liveR) + " R", na(liveR) ? dashBg : (liveR >= 0 ? color.new(#089981, 65) : color.new(#f23645, 65)))
-    row(12, "MFE · MAE",    phase == 4 ? r2(mfeR) + " R · " + r2(maeR) + " R" : "—", dashBg)
-    row(13, "Last price",   px(close), dashBg)
-    row(14, "Size · risk",  showSize and not na(qty) ? r2(qty) + " · " + r2(riskCash) : "—", dashBg)
-    row(15, "Record",       str.tostring(setups) + " setups · " + str.tostring(wins) + "W/" + str.tostring(losses) + "L" + (na(winRate) ? "" : " · " + r2(winRate) + "%"), dashBg)
-    row(16, "Bar closes",   cdTxt + "   |   " + r2(sumR) + " R total", dashBg)
+    row(3,  "HTF bias",     biasTxt, dashBg)
+    row(4,  "Range %",      (na(rangePct) ? "—" : r2(rangePct)) + " / " + r2(accWidth), dashBg)
+    row(5,  "Acc. hi · lo", px(accHigh) + " · " + px(accLow), dashBg)
+    row(6,  "Sweep",        manDir == 0 ? "—" : (manDir == 1 ? "highs @ " : "lows @ ") + px(manExt), dashBg)
+    row(7,  "Bars left",    na(barsLeft) ? "—" : str.tostring(barsLeft), dashBg)
+    row(8,  "FVG",          na(fvgTop) ? "—" : px(fvgBot) + " → " + px(fvgTop), dashBg)
+    row(9,  "POI",          str.length(poiTxt) > 0 ? poiTxt : "—", poiSMT ? color.new(color.purple, 65) : dashBg)
+    row(10, phase == 4 ? "Entry" : "Entry (pending)", px(refEntry), dashBg)
+    row(11, "Stop" + (beMoved ? " (BE)" : ""), px(refSL) + (na(tickSL) ? "" : "  " + str.tostring(math.round(tickSL)) + "t"), dashBg)
+    row(12, "Target",       px(refTP) + (na(tickTP) ? "" : "  " + str.tostring(math.round(tickTP)) + "t"), dashBg)
+    row(13, "Open R · %",   na(liveR) ? "—" : r2(liveR) + " R · " + r2(livePct) + "%", na(liveR) ? dashBg : (liveR >= 0 ? color.new(#089981, 65) : color.new(#f23645, 65)))
+    row(14, "MFE · MAE",    phase == 4 ? r2(mfeR) + " R · " + r2(maeR) + " R" : "—", dashBg)
+    row(15, "Size · risk",  showSize and not na(qty) ? r2(qty) + " · " + r2(riskCash) : "—", dashBg)
+    row(16, "Record",       str.tostring(setups) + " setups · " + str.tostring(wins) + "W/" + str.tostring(losses) + "L/" + str.tostring(bes) + "BE" + (na(winRate) ? "" : " · " + r2(winRate) + "%"), dashBg)
+    row(17, "Totals",       r2(sumR) + " R · " + r2(sumPct) + "%", dashBg)
+    row(18, "Bar closes",   cdTxt, dashBg)
+    row(19, "Journal",      showJournal and str.length(lastRow) > 0 ? lastRow : "—", dashBg)
 
 // Floating label that follows price while a setup is armed or a trade is open
 if showLive and barstate.islast
     txt = phase == 4 ?
-         (tradeDir == 1 ? "LONG " : "SHORT ") + r2(liveR) + "R   SL " + px(slLevel) + "   TP " + px(tpLevel) :
+         (tradeDir == 1 ? "LONG " : "SHORT ") + r2(liveR) + "R / " + r2(livePct) + "%   SL " + px(slLevel) + (beMoved ? " (BE)" : "") + "   TP " + px(tpLevel) :
          phase == 3 ? (tradeDir == 1 ? "LONG limit " : "SHORT limit ") + px(pendEntry) : ""
     if str.length(txt) == 0
         if not na(liveLbl)
@@ -465,32 +584,35 @@ if showLive and barstate.islast
 
 // ═══════════════════════════ ALERTS ═════════════════════════════════════════
 if evtAcc
-    alert("AMD: accumulation range " + px(accLow) + " – " + px(accHigh), alert.freq_once_per_bar)
+    alert("PO3: accumulation range " + px(accLow) + " – " + px(accHigh) + " · " + sessTxt, alert.freq_once_per_bar)
 if evtSweep
-    alert("AMD: " + (manDir == 1 ? "high" : "low") + " sweep at " + px(manExt), alert.freq_once_per_bar)
+    alert("PO3: " + (manDir == 1 ? "high" : "low") + " sweep at " + px(manExt) + (poiSMT ? " · SMT vs " + smtSym : ""), alert.freq_once_per_bar)
 if evtArm
-    alert("AMD: " + (tradeDir == 1 ? "LONG" : "SHORT") + " armed — entry " + px(pendEntry) + " SL " + px(pendSL) + " TP " + px(pendTP), alert.freq_once_per_bar)
+    alert("PO3: " + (tradeDir == 1 ? "LONG" : "SHORT") + " armed — entry " + px(pendEntry) + " SL " + px(pendSL) + " TP " + px(pendTP) + " · " + poiTxt, alert.freq_once_per_bar)
 if evtFill
-    alert("AMD: " + (tradeDir == 1 ? "LONG" : "SHORT") + " filled at " + px(entryPrice) + " · SL " + px(slLevel) + " · TP " + px(tpLevel), alert.freq_once_per_bar)
-if evtTP
-    alert("AMD: target hit (+" + r2(rrr) + "R)", alert.freq_once_per_bar)
-if evtSL
-    alert("AMD: stop hit (-1R)", alert.freq_once_per_bar)
+    alert("PO3: " + (tradeDir == 1 ? "LONG" : "SHORT") + " filled at " + px(entryPrice) + " · SL " + px(slLevel) + " · TP " + px(tpLevel) + " · " + entrySess + " · " + poiTxt, alert.freq_once_per_bar)
+if evtBE
+    alert("PO3: stop moved to break-even at " + px(entryPrice), alert.freq_once_per_bar)
+if evtTP or evtSL
+    alert("PO3 journal row → " + journalRow, alert.freq_once_per_bar)
 if evtCancel
-    alert("AMD: setup invalidated", alert.freq_once_per_bar)
+    alert("PO3: setup invalidated", alert.freq_once_per_bar)
 
-alertcondition(evtSweep, "AMD sweep",        "AMD manipulation sweep")
-alertcondition(evtArm,   "AMD setup armed",  "AMD FVG setup armed")
-alertcondition(evtFill,  "AMD entry filled", "AMD entry filled")
-alertcondition(evtTP,    "AMD target hit",   "AMD target hit")
-alertcondition(evtSL,    "AMD stop hit",     "AMD stop hit")
+alertcondition(evtSweep, "PO3 sweep",        "PO3 manipulation sweep")
+alertcondition(evtArm,   "PO3 setup armed",  "PO3 FVG setup armed")
+alertcondition(evtFill,  "PO3 entry filled", "PO3 entry filled")
+alertcondition(evtBE,    "PO3 break-even",   "PO3 stop moved to break-even")
+alertcondition(evtTP,    "PO3 target hit",   "PO3 target hit — WIN execution")
+alertcondition(evtSL,    "PO3 stop hit",     "PO3 stop hit")
 
 // ═══════════════════════════ DATA WINDOW / SCREENER FEED ════════════════════
-plot(phase,         "Phase",      display = display.data_window)
-plot(tradeDir,      "Direction",  display = display.data_window)
-plot(refEntry,      "Entry",      display = display.data_window)
-plot(refSL,         "Stop",       display = display.data_window)
-plot(refTP,         "Target",     display = display.data_window)
-plot(liveR,         "Open R",     display = display.data_window)
-plot(sumR,          "Total R",    display = display.data_window)
-plot(rangePct,      "Range %",    display = display.data_window)
+plot(phase,    "Phase",     display = display.data_window)
+plot(tradeDir, "Direction", display = display.data_window)
+plot(htfBias,  "HTF bias",  display = display.data_window)
+plot(refEntry, "Entry",     display = display.data_window)
+plot(refSL,    "Stop",      display = display.data_window)
+plot(refTP,    "Target",    display = display.data_window)
+plot(liveR,    "Open R",    display = display.data_window)
+plot(livePct,  "Open %",    display = display.data_window)
+plot(sumR,     "Total R",   display = display.data_window)
+plot(sumPct,   "Total %",   display = display.data_window)
