@@ -24,7 +24,12 @@ indicator("AMD PO3 FVG Real-Time Monitor", "AMD PO3 RT", overlay = true,
 // ═══════════════════════════ INPUTS ═════════════════════════════════════════
 gA = "AMD / PO3 logic"
 accLen            = input.int(30, "Accumulation length", minval = 5, group = gA)
-accWidth          = input.float(0.2, "Accumulation max range %", minval = 0.01, step = 0.1, group = gA)
+rangeMode         = input.string("ATR multiple", "Consolidation measured in", options = ["ATR multiple", "Percent of price"], group = gA,
+     tooltip = "ATR multiple travels between instruments and timeframes. A percent threshold does not: 0.2% is ~40 points on NQ but ~10 on ES.")
+accATR            = input.float(1.5, "Max range (× ATR)", minval = 0.1, step = 0.1, group = gA)
+accWidth          = input.float(0.2, "Max range (% of price)", minval = 0.01, step = 0.1, group = gA)
+calLook           = input.int(500, "Calibration lookback (bars)", minval = 50, group = gA,
+     tooltip = "The dashboard reports the tightest range seen over this window, so the threshold above can be set from the chart instead of guessed.")
 manLook           = input.int(10, "Search window after accumulation (bars)", minval = 1, group = gA)
 fvgThreshold      = input.float(0.1, "Min FVG gap (× ATR)", minval = 0.0, step = 0.05, group = gA,
      tooltip = "Minimum size of the 3-bar gap relative to ATR. Higher = only 'strong' displacement.")
@@ -203,8 +208,13 @@ var label liveLbl = na
 atr      = ta.atr(atrLen)
 hiN      = ta.highest(high, accLen)
 loN      = ta.lowest(low, accLen)
-rangePct = loN > 0 ? (hiN - loN) / loN * 100 : na
-isAcc    = not na(rangePct) and rangePct <= accWidth and (not sessionOnly or inAnySess)
+useATRrange = rangeMode == "ATR multiple"
+rangeAbs  = hiN - loN
+rangeVal  = useATRrange ? (atr > 0 ? rangeAbs / atr : na) : (loN > 0 ? rangeAbs / loN * 100 : na)
+rangeLim  = useATRrange ? accATR : accWidth
+rangeUnit = useATRrange ? "xATR" : "%"
+tightest  = ta.lowest(rangeVal, calLook)
+isAcc     = not na(rangeVal) and rangeVal <= rangeLim and (not sessionOnly or inAnySess)
 
 newBar = confirmOnly ? barstate.isconfirmed : true
 tickOk = liveTrack ? true : barstate.isconfirmed
@@ -511,6 +521,16 @@ phaseCol = switch phase
     4 => tradeDir == 1 ? color.new(#089981, 45) : color.new(#f23645, 45)
     => color.new(color.gray, 75)
 
+// Why is nothing happening? Name the condition the model is actually stuck on.
+diagTxt = switch phase
+    1 => isAcc ? "range forming — " + str.tostring(math.max(0, accEnd + manLook - bar_index)) + " bars to sweep" : "sweep of " + px(accHigh) + " / " + px(accLow)
+    2 => "FVG of at least " + r2(fvgThreshold) + " xATR"
+    3 => "fill at " + px(pendEntry)
+    4 => "SL " + px(slLevel) + " / TP " + px(tpLevel)
+    => sessionOnly and not inAnySess ? "outside session" :
+       na(rangeVal) ? "more bars" :
+       "range to tighten: " + r2(rangeVal) + " > " + r2(rangeLim) + " " + rangeUnit
+
 refEntry = phase == 4 ? entryPrice : pendEntry
 refSL    = phase == 4 ? slLevel    : pendSL
 refTP    = phase == 4 ? tpLevel    : pendTP
@@ -536,7 +556,7 @@ dashPos = switch dashPosIn
     "Middle right" => position.middle_right
     => position.top_right
 
-var table dash = table.new(dashPos, 2, 20, border_width = 1, border_color = color.new(color.gray, 70), frame_width = 1, frame_color = color.new(color.gray, 60))
+var table dash = table.new(dashPos, 2, 22, border_width = 1, border_color = color.new(color.gray, 70), frame_width = 1, frame_color = color.new(color.gray, 60))
 
 row(int r, string k, string v, color bg) =>
     table.cell(dash, 0, r, k, text_color = color.new(dashFg, 25), bgcolor = bg, text_size = dashSize, text_halign = text.align_left)
@@ -548,7 +568,8 @@ if showDash and barstate.islast
     row(1,  "Session",      sessTxt, inAnySess ? color.new(#089981, 75) : dashBg)
     row(2,  "Phase",        phaseTxt, phaseCol)
     row(3,  "HTF bias",     biasTxt, dashBg)
-    row(4,  "Range %",      (na(rangePct) ? "—" : r2(rangePct)) + " / " + r2(accWidth), dashBg)
+    row(4,  "Range",        (na(rangeVal) ? "—" : r2(rangeVal)) + " / " + r2(rangeLim) + " " + rangeUnit,
+         not na(rangeVal) and rangeVal <= rangeLim ? color.new(#089981, 75) : dashBg)
     row(5,  "Acc. hi · lo", px(accHigh) + " · " + px(accLow), dashBg)
     row(6,  "Sweep",        manDir == 0 ? "—" : (manDir == 1 ? "highs @ " : "lows @ ") + px(manExt), dashBg)
     row(7,  "Bars left",    na(barsLeft) ? "—" : str.tostring(barsLeft), dashBg)
@@ -564,6 +585,9 @@ if showDash and barstate.islast
     row(17, "Totals",       r2(sumR) + " R · " + r2(sumPct) + "%", dashBg)
     row(18, "Bar closes",   cdTxt, dashBg)
     row(19, "Journal",      showJournal and str.length(lastRow) > 0 ? lastRow : "—", dashBg)
+    row(20, "Waiting on",   diagTxt, phase == 0 ? color.new(color.gray, 70) : color.new(color.orange, 70))
+    row(21, "Tightest " + str.tostring(calLook) + "b", na(tightest) ? "—" : r2(tightest) + " " + rangeUnit +
+         (not na(tightest) and tightest <= rangeLim ? "  (reachable)" : "  → raise limit"), dashBg)
 
 // Floating label that follows price while a setup is armed or a trade is open
 if showLive and barstate.islast
@@ -616,3 +640,5 @@ plot(liveR,    "Open R",    display = display.data_window)
 plot(livePct,  "Open %",    display = display.data_window)
 plot(sumR,     "Total R",   display = display.data_window)
 plot(sumPct,   "Total %",   display = display.data_window)
+plot(rangeVal, "Range",     display = display.data_window)
+plot(tightest, "Tightest range", display = display.data_window)
